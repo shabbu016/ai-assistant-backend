@@ -165,6 +165,10 @@ def health():
 # AI CHAT
 # ============================================================
 
+# ============================================================
+# AI CHAT
+# ============================================================
+
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json(silent=True) or {}
@@ -177,6 +181,179 @@ def chat():
         }), 400
 
     try:
+        text = message.lower()
+
+        # ====================================================
+        # SLACK - SEND
+        # ====================================================
+
+        if "send slack" in text:
+
+            import re
+
+            channel_match = re.search(
+                r"#([a-zA-Z0-9_-]+)",
+                message
+            )
+
+            if channel_match:
+                channel = channel_match.group(1)
+            else:
+                channel = "new-channel"
+
+            if ":" not in message:
+                return jsonify({
+                    "reply": (
+                        "Please provide the Slack message. "
+                        "Example: Send Slack message to "
+                        "#new-channel: Hello team"
+                    ),
+                    "slack_connected": True
+                })
+
+            slack_message = message.split(":", 1)[1].strip()
+
+            if not slack_message:
+                return jsonify({
+                    "reply": "Please provide a message to send to Slack.",
+                    "slack_connected": True
+                })
+
+            # Find channel ID
+            channels = slack_client.conversations_list(
+                types="public_channel"
+            )
+
+            channel_id = None
+
+            for ch in channels.get("channels", []):
+                if ch.get("name") == channel:
+                    channel_id = ch.get("id")
+                    break
+
+            if not channel_id:
+                return jsonify({
+                    "reply": f"Slack channel #{channel} was not found.",
+                    "slack_connected": True
+                })
+
+            # Send message
+            slack_client.chat_postMessage(
+                channel=channel_id,
+                text=slack_message
+            )
+
+            return jsonify({
+                "reply": (
+                    f"Message sent successfully to #{channel}."
+                ),
+                "slack_connected": True,
+                "channel": channel
+            })
+
+        # ====================================================
+        # SLACK - READ
+        # ====================================================
+
+        slack_read_request = (
+            "slack" in text
+            or "#" in text
+        ) and (
+            "read" in text
+            or "latest messages" in text
+            or "messages" in text
+            or "recent messages" in text
+        )
+
+        if slack_read_request:
+
+            import re
+
+            channel_match = re.search(
+                r"#([a-zA-Z0-9_-]+)",
+                message
+            )
+
+            if channel_match:
+                channel = channel_match.group(1)
+            else:
+                channel = "new-channel"
+
+            # Find channel ID
+            channels = slack_client.conversations_list(
+                types="public_channel"
+            )
+
+            channel_id = None
+
+            for ch in channels.get("channels", []):
+                if ch.get("name") == channel:
+                    channel_id = ch.get("id")
+                    break
+
+            if not channel_id:
+                return jsonify({
+                    "reply": f"Slack channel #{channel} was not found.",
+                    "slack_connected": True
+                })
+
+            # Get recent messages
+            result = slack_client.conversations_history(
+                channel=channel_id,
+                limit=5
+            )
+
+            messages = result.get("messages", [])
+
+            if not messages:
+                return jsonify({
+                    "reply": f"No messages found in #{channel}.",
+                    "slack_connected": True,
+                    "channel": channel,
+                    "message_count": 0
+                })
+
+            slack_context = "\n".join(
+                [
+                    f"[{msg.get('user', 'Unknown')}]: "
+                    f"{msg.get('text', '')}"
+                    for msg in messages
+                ]
+            )
+
+            # Let Groq summarize/respond naturally
+            response = client.chat.completions.create(
+                model="openai/gpt-oss-120b",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a smart AI personal assistant. "
+                            "The user has connected Slack. "
+                            "Use ONLY the provided Slack messages. "
+                            "Do not invent messages or details."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"User request:\n{message}\n\n"
+                            f"Recent Slack messages from "
+                            f"#{channel}:\n{slack_context}"
+                        )
+                    }
+                ]
+            )
+
+            reply = response.choices[0].message.content
+
+            return jsonify({
+                "reply": reply,
+                "slack_connected": True,
+                "channel": channel,
+                "message_count": len(messages)
+            })
+
         # ====================================================
         # CHECK WHETHER USER IS ASKING ABOUT GMAIL
         # ====================================================
@@ -191,7 +368,7 @@ def chat():
         ]
 
         is_gmail_request = any(
-            keyword in message.lower()
+            keyword in text
             for keyword in gmail_keywords
         )
 
@@ -200,6 +377,7 @@ def chat():
         # ====================================================
 
         if not is_gmail_request:
+
             response = client.chat.completions.create(
                 model="openai/gpt-oss-120b",
                 messages=[
@@ -225,8 +403,11 @@ def chat():
         # ====================================================
         # GMAIL REQUEST
         # ====================================================
+
         credentials = get_gmail_credentials()
+
         if not credentials:
+
             return jsonify({
                 "reply": (
                     "Your Gmail account is not currently connected. "
@@ -259,6 +440,7 @@ def chat():
         emails = []
 
         for message_item in messages:
+
             msg = service.users().messages().get(
                 userId="me",
                 id=message_item["id"],
@@ -270,21 +452,28 @@ def chat():
                 ]
             ).execute()
 
-            headers = msg.get(
-                "payload",
-                {}
-            ).get(
-                "headers",
-                []
+            headers = (
+                msg.get(
+                    "payload",
+                    {}
+                ).get(
+                    "headers",
+                    []
+                )
             )
 
             email_data = {}
 
             for header in headers:
+
                 name = header.get("name")
                 value = header.get("value")
 
-                if name in ["From", "Subject", "Date"]:
+                if name in [
+                    "From",
+                    "Subject",
+                    "Date"
+                ]:
                     email_data[name.lower()] = value
 
             emails.append(email_data)
@@ -335,13 +524,13 @@ def chat():
         })
 
     except Exception as e:
+
         print("[Backend] Chat error:", e)
 
         return jsonify({
             "error": "Unable to process your request.",
             "details": str(e)
         }), 500
-
 # ============================================================
 # GMAIL - START AUTHENTICATION
 # ============================================================
