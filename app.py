@@ -2,6 +2,7 @@ import os
 from flask import Flask, request, jsonify, redirect, session
 from dotenv import load_dotenv
 from groq import Groq
+import psycopg2
 
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
@@ -19,6 +20,8 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-this-secret-key")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY is not configured.")
@@ -28,6 +31,9 @@ if not GOOGLE_CLIENT_ID:
 
 if not GOOGLE_CLIENT_SECRET:
     raise RuntimeError("GOOGLE_CLIENT_SECRET is not configured.")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not configured.")
 
 client = Groq(api_key=GROQ_API_KEY)
 
@@ -39,9 +45,72 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly"
 ]
 
-# Temporary in-memory storage.
-# This is suitable for our current testing/single-user setup.
-gmail_credentials = None
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_database():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS gmail_credentials (
+            id INTEGER PRIMARY KEY,
+            credentials TEXT NOT NULL
+        )
+    """)
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    print("[Database] PostgreSQL initialized successfully.")
+
+
+def save_gmail_credentials(credentials):
+    credentials_json = credentials.to_json()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO gmail_credentials (id, credentials)
+        VALUES (1, %s)
+        ON CONFLICT (id)
+        DO UPDATE SET credentials = EXCLUDED.credentials
+    """, (credentials_json,))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    print("[Gmail] Credentials saved to PostgreSQL.")
+
+
+def get_gmail_credentials():
+    import json
+    from google.oauth2.credentials import Credentials
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT credentials
+        FROM gmail_credentials
+        WHERE id = 1
+    """)
+
+    row = cursor.fetchone()
+
+    cursor.close()
+    conn.close()
+
+    if not row:
+        return None
+
+    return Credentials.from_authorized_user_info(
+        json.loads(row[0])
+    )
 
 
 # ============================================================
@@ -100,16 +169,151 @@ def chat():
         }), 400
 
     try:
+        # ====================================================
+        # CHECK WHETHER USER IS ASKING ABOUT GMAIL
+        # ====================================================
+
+        gmail_keywords = [
+            "email",
+            "emails",
+            "gmail",
+            "inbox",
+            "mail",
+            "unread"
+        ]
+
+        is_gmail_request = any(
+            keyword in message.lower()
+            for keyword in gmail_keywords
+        )
+
+        # ====================================================
+        # NORMAL AI CHAT
+        # ====================================================
+
+        if not is_gmail_request:
+            response = client.chat.completions.create(
+                model="openai/gpt-oss-120b",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a smart AI personal assistant."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": message
+                    }
+                ]
+            )
+
+            reply = response.choices[0].message.content
+
+            return jsonify({
+                "reply": reply
+            })
+
+        # ====================================================
+        # GMAIL REQUEST
+        # ====================================================
+        credentials = get_gmail_credentials()
+        if not credentials:
+            return jsonify({
+                "reply": (
+                    "Your Gmail account is not currently connected. "
+                    "Please connect Gmail first."
+                ),
+                "gmail_connected": False,
+                "authorization_url": (
+                    "https://ai-assistant-backend-fhht.onrender.com/"
+                    "auth/gmail"
+                )
+            })
+
+        # ====================================================
+        # FETCH EMAILS
+        # ====================================================
+
+        service = build(
+            "gmail",
+            "v1",
+            credentials=credentials
+        )
+
+        results = service.users().messages().list(
+            userId="me",
+            maxResults=5
+        ).execute()
+
+        messages = results.get("messages", [])
+
+        emails = []
+
+        for message_item in messages:
+            msg = service.users().messages().get(
+                userId="me",
+                id=message_item["id"],
+                format="metadata",
+                metadataHeaders=[
+                    "From",
+                    "Subject",
+                    "Date"
+                ]
+            ).execute()
+
+            headers = msg.get(
+                "payload",
+                {}
+            ).get(
+                "headers",
+                []
+            )
+
+            email_data = {}
+
+            for header in headers:
+                name = header.get("name")
+                value = header.get("value")
+
+                if name in ["From", "Subject", "Date"]:
+                    email_data[name.lower()] = value
+
+            emails.append(email_data)
+
+        # ====================================================
+        # GIVE EMAIL DATA TO GROQ
+        # ====================================================
+
+        email_context = "\n\n".join(
+            [
+                f"Email {i + 1}:\n"
+                f"From: {email.get('from', 'Unknown')}\n"
+                f"Subject: {email.get('subject', 'No subject')}\n"
+                f"Date: {email.get('date', 'Unknown')}"
+                for i, email in enumerate(emails)
+            ]
+        )
+
         response = client.chat.completions.create(
             model="openai/gpt-oss-120b",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a smart AI personal assistant."
+                    "content": (
+                        "You are a smart AI personal assistant. "
+                        "The user has connected Gmail. "
+                        "Use the provided email information to answer "
+                        "the user's question accurately. "
+                        "Do not invent email details."
+                    )
                 },
                 {
                     "role": "user",
-                    "content": message
+                    "content": (
+                        f"User request:\n{message}\n\n"
+                        f"Latest Gmail emails:\n{email_context}"
+                    )
                 }
             ]
         )
@@ -117,16 +321,18 @@ def chat():
         reply = response.choices[0].message.content
 
         return jsonify({
-            "reply": reply
+            "reply": reply,
+            "gmail_connected": True,
+            "email_count": len(emails)
         })
 
     except Exception as e:
-        print("[Backend] Groq error:", e)
+        print("[Backend] Chat error:", e)
 
         return jsonify({
-            "error": "AI service temporarily unavailable."
+            "error": "Unable to process your request.",
+            "details": str(e)
         }), 500
-
 
 # ============================================================
 # GMAIL - START AUTHENTICATION
@@ -186,7 +392,7 @@ def gmail_callback():
 
         credentials = flow.credentials
 
-        gmail_credentials = credentials
+        save_gmail_credentials(credentials)
 
         # Clean up temporary OAuth session values
         session.pop("google_oauth_state", None)
@@ -228,6 +434,7 @@ def gmail_callback():
 
 @app.route("/gmail/status", methods=["GET"])
 def gmail_status():
+    credentials = get_gmail_credentials()
     if gmail_credentials:
         return jsonify({
             "connected": True,
@@ -246,7 +453,8 @@ def gmail_status():
 
 @app.route("/gmail/emails", methods=["GET"])
 def gmail_emails():
-    if not gmail_credentials:
+    credentials = get_gmail_credentials()
+    if not credentials:
         return jsonify({
             "error": "Gmail is not connected.",
             "authorization_url":
@@ -257,7 +465,7 @@ def gmail_emails():
         service = build(
             "gmail",
             "v1",
-            credentials=gmail_credentials
+            credentials=credentials
         )
 
         results = service.users().messages().list(
@@ -310,6 +518,14 @@ def gmail_emails():
             "details": str(e)
         }), 500
 
+# ============================================================
+# DATABASE INITIALIZATION
+# ============================================================
+
+try:
+    init_database()
+except Exception as e:
+    print("[Database] Initialization error:", e)
 
 # ============================================================
 # RUN LOCALLY
