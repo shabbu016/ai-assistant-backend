@@ -22,7 +22,12 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 DATABASE_URL = os.getenv("DATABASE_URL")
-
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_FROM = os.getenv(
+    "TWILIO_WHATSAPP_FROM",
+    "whatsapp:+14155238886"
+)
 
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY is not configured.")
@@ -352,6 +357,71 @@ def chat():
                 "slack_connected": True,
                 "channel": channel,
                 "message_count": len(messages)
+            })
+
+                # ====================================================
+        # WHATSAPP - SEND
+        # ====================================================
+
+        if "send whatsapp" in text:
+
+            import re
+
+            phone_match = re.search(
+                r"\+91\d{10}",
+                message
+            )
+
+            if not phone_match:
+                return jsonify({
+                    "reply": (
+                        "Please provide the WhatsApp number "
+                        "with country code. "
+                        "Example: Send WhatsApp to "
+                        "+919611748091: Hello"
+                    ),
+                    "whatsapp_connected": True
+                })
+
+            phone_number = phone_match.group(0)
+
+            if ":" not in message:
+                return jsonify({
+                    "reply": (
+                        "Please provide the message. "
+                        "Example: Send WhatsApp to "
+                        "+919611748091: Hello"
+                    ),
+                    "whatsapp_connected": True
+                })
+
+            whatsapp_message = message.split(":", 1)[1].strip()
+
+            if not whatsapp_message:
+                return jsonify({
+                    "reply": "Please provide a message to send.",
+                    "whatsapp_connected": True
+                })
+
+            from twilio.rest import Client
+
+            twilio_client = Client(
+                TWILIO_ACCOUNT_SID,
+                TWILIO_AUTH_TOKEN
+            )
+
+            to_number = f"whatsapp:{phone_number}"
+
+            result = twilio_client.messages.create(
+                body=whatsapp_message,
+                from_=TWILIO_WHATSAPP_FROM,
+                to=to_number
+            )
+
+            return jsonify({
+                "reply": "WhatsApp message sent successfully.",
+                "whatsapp_connected": True,
+                "sid": result.sid
             })
 
         # ====================================================
@@ -853,6 +923,60 @@ def slack_send():
             "error": "Unable to send Slack message.",
             "details": str(e)
         }), 500
+
+# ============================================================
+# WHATSAPP - SEND
+# ============================================================
+
+@app.route("/whatsapp/send", methods=["POST"])
+def whatsapp_send():
+    data = request.get_json(silent=True) or {}
+
+    to_number = str(data.get("to", "")).strip()
+    message = str(data.get("message", "")).strip()
+
+    if not to_number:
+        return jsonify({
+            "error": "WhatsApp recipient number is required."
+        }), 400
+
+    if not message:
+        return jsonify({
+            "error": "WhatsApp message is required."
+        }), 400
+
+    try:
+        from twilio.rest import Client
+
+        twilio_client = Client(
+            TWILIO_ACCOUNT_SID,
+            TWILIO_AUTH_TOKEN
+        )
+
+        if not to_number.startswith("whatsapp:"):
+            to_number = f"whatsapp:{to_number}"
+
+        result = twilio_client.messages.create(
+            body=message,
+            from_=TWILIO_WHATSAPP_FROM,
+            to=to_number
+        )
+
+        return jsonify({
+            "reply": "WhatsApp message sent successfully.",
+            "success": True,
+            "sid": result.sid,
+            "to": to_number
+        })
+
+    except Exception as e:
+        print("[Backend] WhatsApp send error:", e)
+
+        return jsonify({
+            "error": "Unable to send WhatsApp message.",
+            "details": str(e)
+        }), 500
+
 
 # ============================================================
 # RUN LOCALLY
