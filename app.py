@@ -369,7 +369,6 @@ def gmail_auth():
 
 @app.route("/auth/gmail/callback", methods=["GET"])
 def gmail_callback():
-    global gmail_credentials
 
     try:
         state = session.get("google_oauth_state")
@@ -435,7 +434,8 @@ def gmail_callback():
 @app.route("/gmail/status", methods=["GET"])
 def gmail_status():
     credentials = get_gmail_credentials()
-    if gmail_credentials:
+
+    if credentials:
         return jsonify({
             "connected": True,
             "service": "Gmail"
@@ -445,7 +445,6 @@ def gmail_status():
         "connected": False,
         "service": "Gmail"
     })
-
 
 # ============================================================
 # GMAIL - READ EMAILS
