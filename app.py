@@ -2,6 +2,7 @@ import os
 from flask import Flask, request, jsonify, redirect, session
 from dotenv import load_dotenv
 from groq import Groq
+from slack_sdk import WebClient 
 import psycopg2
 
 from google_auth_oauthlib.flow import Flow
@@ -36,6 +37,13 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not configured.")
 
 client = Groq(api_key=GROQ_API_KEY)
+
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+
+if not SLACK_BOT_TOKEN:
+    raise RuntimeError("SLACK_BOT_TOKEN is not configured.")
+
+slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
 GOOGLE_REDIRECT_URI = (
     "https://ai-assistant-backend-fhht.onrender.com/auth/gmail/callback"
@@ -525,6 +533,137 @@ try:
     init_database()
 except Exception as e:
     print("[Database] Initialization error:", e)
+
+
+@app.route("/slack/status", methods=["GET"])
+def slack_status():
+    try:
+        response = slack_client.auth_test()
+
+        return jsonify({
+            "connected": response.get("ok", False),
+            "service": "Slack",
+            "bot": response.get("user"),
+            "team": response.get("team")
+        })
+
+    except Exception as e:
+        print("[Slack] Status error:", e)
+
+        return jsonify({
+            "connected": False,
+            "service": "Slack",
+            "error": str(e)
+        }), 500
+
+@app.route("/slack/messages", methods=["GET"])
+def slack_messages():
+    channel = request.args.get("channel", "new-channel")
+    limit = int(request.args.get("limit", 5))
+
+    try:
+        channel_name = channel.lstrip("#")
+
+        channels = slack_client.conversations_list(
+            types="public_channel"
+        )
+
+        channel_id = None
+
+        for ch in channels.get("channels", []):
+            if ch.get("name") == channel_name:
+                channel_id = ch.get("id")
+                break
+
+        if not channel_id:
+            return jsonify({
+                "error": f"Channel #{channel_name} not found."
+            }), 404
+
+        result = slack_client.conversations_history(
+            channel=channel_id,
+            limit=limit
+        )
+
+        messages = []
+
+        for msg in result.get("messages", []):
+            messages.append({
+                "user": msg.get("user", "Unknown"),
+                "text": msg.get("text", ""),
+                "timestamp": msg.get("ts")
+            })
+
+        return jsonify({
+            "connected": True,
+            "channel": f"#{channel_name}",
+            "count": len(messages),
+            "messages": messages
+        })
+
+    except Exception as e:
+        print("[Slack] Read error:", e)
+
+        return jsonify({
+            "error": "Unable to read Slack messages.",
+            "details": str(e)
+        }), 500
+
+
+@app.route("/slack/send", methods=["POST"])
+def slack_send():
+    data = request.get_json(silent=True) or {}
+
+    channel = str(data.get("channel", "")).strip()
+    message = str(data.get("message", "")).strip()
+
+    if not channel:
+        return jsonify({
+            "error": "Channel is required."
+        }), 400
+
+    if not message:
+        return jsonify({
+            "error": "Message is required."
+        }), 400
+
+    try:
+        channel_name = channel.lstrip("#")
+
+        channels = slack_client.conversations_list(
+            types="public_channel"
+        )
+
+        channel_id = None
+
+        for ch in channels.get("channels", []):
+            if ch.get("name") == channel_name:
+                channel_id = ch.get("id")
+                break
+
+        if not channel_id:
+            return jsonify({
+                "error": f"Channel #{channel_name} not found."
+            }), 404
+
+        slack_client.chat_postMessage(
+            channel=channel_id,
+            text=message
+        )
+
+        return jsonify({
+            "success": True,
+            "channel": f"#{channel_name}",
+            "message": message
+        })
+
+    except Exception as e:
+        print("[Slack] Send error:", e)
+
+        return jsonify({
+            "error": "Unable to send Slack message.",
+            "details": str(e)
+        }), 500
 
 # ============================================================
 # RUN LOCALLY
