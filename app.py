@@ -143,7 +143,9 @@ def gmail_auth():
             prompt="consent"
         )
 
+        # Store BOTH OAuth state and PKCE verifier
         session["google_oauth_state"] = state
+        session["google_oauth_code_verifier"] = flow.code_verifier
 
         return redirect(authorization_url)
 
@@ -155,7 +157,6 @@ def gmail_auth():
             "details": str(e)
         }), 500
 
-
 # ============================================================
 # GMAIL - OAUTH CALLBACK
 # ============================================================
@@ -166,11 +167,18 @@ def gmail_callback():
 
     try:
         state = session.get("google_oauth_state")
+        code_verifier = session.get("google_oauth_code_verifier")
+
+        if not state:
+            return "OAuth session expired. Please start Gmail authentication again.", 400
+
+        if not code_verifier:
+            return "OAuth code verifier missing. Please start Gmail authentication again.", 400
 
         flow = create_google_flow()
 
-        if state:
-            flow.state = state
+        flow.state = state
+        flow.code_verifier = code_verifier
 
         flow.fetch_token(
             authorization_response=request.url
@@ -179,6 +187,10 @@ def gmail_callback():
         credentials = flow.credentials
 
         gmail_credentials = credentials
+
+        # Clean up temporary OAuth session values
+        session.pop("google_oauth_state", None)
+        session.pop("google_oauth_code_verifier", None)
 
         return """
         <!DOCTYPE html>
@@ -209,7 +221,6 @@ def gmail_callback():
         </body>
         </html>
         """, 500
-
 
 # ============================================================
 # GMAIL - CONNECTION STATUS
